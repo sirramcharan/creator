@@ -8,13 +8,6 @@ st.set_page_config(page_title="YouTube Creator Day Planner", layout="wide")
 
 # ---------- HELPERS ----------
 
-def debug_columns(df_raw: pd.DataFrame):
-    st.write("Detected columns:", list(df_raw.columns))
-    if "Video publish time" in df_raw.columns:
-        st.write("Sample 'Video publish time' values:")
-        st.write(df_raw["Video publish time"].head(10))
-
-
 def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Clean YouTube Studio export based on your structure:
@@ -24,24 +17,18 @@ def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     df = df_raw.copy()
 
-    # Debug info
-    debug_columns(df_raw)
-
     # 1. Drop 'Total' summary row
     if "Content" in df.columns:
-        before = len(df)
         df = df[df["Content"] != "Total"]
-        st.write(f"Rows after removing 'Total' row: {len(df)} (was {before})")
 
     # 2. Parse publish date from 'Video publish time'
     if "Video publish time" not in df.columns:
         st.error("Expected column 'Video publish time' not found. Check CSV headers.")
         return pd.DataFrame()
 
-    # Use pandas inference (works according to your debug: 127 non-null)
+    # Let pandas infer the date format (works for your data)
     date_series = df["Video publish time"].astype(str).str.strip()
-    parsed = pd.to_datetime(date_series, errors="coerce")  # infer format
-    st.write(f"Parsed publish dates (infer): {parsed.notna().sum()} non-null")
+    parsed = pd.to_datetime(date_series, errors="coerce")
 
     if parsed.notna().sum() == 0:
         st.error("Could not parse any dates from 'Video publish time'.")
@@ -81,14 +68,9 @@ def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # 5. Drop rows missing key fields
-    before = len(df)
     df = df.dropna(subset=["publish_date"])
-    st.write(f"Rows after dropping missing publish_date: {len(df)} (was {before})")
-
     if "views" in df.columns:
-        before = len(df)
         df = df.dropna(subset=["views"])
-        st.write(f"Rows after dropping missing views: {len(df)} (was {before})")
     else:
         st.error("Column 'Views' not found (or renamed incorrectly).")
         return pd.DataFrame()
@@ -166,7 +148,7 @@ else:
     df = load_and_clean(df_raw)
 
     if df.empty:
-        st.error("No usable rows after cleaning. Check the debug info above.")
+        st.error("No usable rows after cleaning. Check your CSV.")
         st.stop()
 
     st.success(f"Loaded {len(df)} videos after cleaning.")
@@ -218,8 +200,8 @@ else:
             alt.Chart(day_perf)
             .mark_bar()
             .encode(
-                x=alt.X("dow:N", title="Day of Week"),
-                y=alt.Y("avg_views:Q", title="Avg Views per Video"),
+                x=alt.X("avg_views:Q", title="Avg Views per Video"),
+                y=alt.Y("dow:N", title="Day of Week"),
                 tooltip=["dow", "avg_views"],
             )
             .properties(height=300)
@@ -246,8 +228,8 @@ else:
                 alt.Chart(perf)
                 .mark_bar()
                 .encode(
-                    x=alt.X("dow:N", title="Day of Week"),
-                    y=alt.Y("avg_views:Q", title="Avg Views per Video"),
+                    x=alt.X("avg_views:Q", title="Avg Views per Video"),
+                    y=alt.Y("dow:N", title="Day of Week"),
                     tooltip=["dow", "avg_views"],
                 )
                 .properties(height=300)
@@ -355,26 +337,26 @@ else:
             st.markdown("### Scenario summary")
             st.dataframe(res_df)
 
-            st.markdown("### Total views by scenario")
+            st.markdown("### Total views by scenario (horizontal)")
             chart_scen_total = (
                 alt.Chart(res_df)
                 .mark_bar()
                 .encode(
-                    x=alt.X("Scenario:N"),
-                    y=alt.Y("Total Views:Q"),
+                    y=alt.Y("Scenario:N", title="Scenario"),
+                    x=alt.X("Total Views:Q", title="Total Views"),
                     tooltip=["Scenario", "Total Views", "Videos", "Avg Views/Video"],
                 )
                 .properties(height=300)
             )
             st.altair_chart(chart_scen_total, use_container_width=True)
 
-            st.markdown("### Average views per video by scenario")
+            st.markdown("### Average views per video by scenario (horizontal)")
             chart_scen_avg = (
                 alt.Chart(res_df)
                 .mark_bar(color="#FF7F0E")
                 .encode(
-                    x=alt.X("Scenario:N"),
-                    y=alt.Y("Avg Views/Video:Q"),
+                    y=alt.Y("Scenario:N", title="Scenario"),
+                    x=alt.X("Avg Views/Video:Q", title="Avg Views per Video"),
                     tooltip=["Scenario", "Total Views", "Videos", "Avg Views/Video"],
                 )
                 .properties(height=300)
