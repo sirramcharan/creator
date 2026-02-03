@@ -6,52 +6,112 @@ import altair as alt
 st.set_page_config(page_title="YouTube Creator Day Planner", layout="wide")
 
 
-# ---------- HELPERS ----------
+# ---------- COLUMN HELPERS ----------
+
+def find_col(df, candidates):
+    """Return the first column name from candidates that exists in df, or None."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def show_missing_cols_message(missing_required, df):
+    st.error(
+        "Your CSV is missing some required columns. "
+        "Please export the **video-level report** from YouTube Studio (Advanced mode) "
+        "and include at least the required columns listed below."
+    )
+    st.markdown("**Required columns (any of these names is okay):**")
+    st.markdown("- Date: `Video publish time`, `Published at`, or `Date`")
+    st.markdown("- Views: `Views`")
+
+    st.markdown("**Missing in your file:**")
+    for item in missing_required:
+        st.markdown(f"- {item}")
+
+    st.markdown("**Columns detected in your upload:**")
+    st.write(list(df.columns))
+
+
+# ---------- CLEANING & MODEL HELPERS ----------
 
 def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean YouTube Studio export based on your structure:
-    Content, Video title, Video publish time, Duration, Likes, Dislikes, Shares,
-    Comments added, Views, Watch time (hours), Subscribers, Impressions,
-    Impressions click-through rate (%)
+    Clean YouTube Studio export:
+    - Flexible column mapping
+    - Drop total row
+    - Parse dates
+    - Standardize numeric columns
     """
+
     df = df_raw.copy()
 
-    # 1. Drop 'Total' summary row
+    # Drop 'Total' summary row if present
     if "Content" in df.columns:
         df = df[df["Content"] != "Total"]
 
-    # 2. Parse publish date from 'Video publish time'
-    if "Video publish time" not in df.columns:
-        st.error("Expected column 'Video publish time' not found. Check CSV headers.")
+    # --- Detect required columns ---
+
+    date_col = find_col(df, ["Video publish time", "Published at", "Date"])
+    views_col = find_col(df, ["Views"])
+
+    missing_required = []
+    if date_col is None:
+        missing_required.append("Date column (Video publish time / Published at / Date)")
+    if views_col is None:
+        missing_required.append("Views")
+
+    if missing_required:
+        show_missing_cols_message(missing_required, df_raw)
         return pd.DataFrame()
 
-    date_series = df["Video publish time"].astype(str).str.strip()
-    parsed = pd.to_datetime(date_series, errors="coerce")
+    # --- Parse date ---
 
+    date_series = df[date_col].astype(str).str.strip()
+    parsed = pd.to_datetime(date_series, errors="coerce")
     if parsed.notna().sum() == 0:
-        st.error("Could not parse any dates from 'Video publish time'.")
+        st.error(
+            "Could not parse any dates from the date column. "
+            "Make sure the column contains valid dates (as exported from YouTube Studio)."
+        )
         return pd.DataFrame()
 
     df["publish_date"] = parsed.dt.date
     df["dow"] = parsed.dt.day_name()
     df["year_month"] = parsed.dt.to_period("M").astype(str)  # e.g. '2025-12'
 
-    # 3. Rename numeric columns to simpler names
-    rename_map = {
-        "Views": "views",
-        "Watch time (hours)": "watch_time_hours",
-        "Impressions": "impressions",
-        "Impressions click-through rate (%)": "ctr_percent",
-        "Subscribers": "subscribers",
-        "Likes": "likes",
-        "Dislikes": "dislikes",
-        "Shares": "shares",
-        "Comments added": "comments",
-    }
+    # --- Standardize key numeric columns ---
+
+    rename_map = {}
+
+    # Always rename views column
+    rename_map[views_col] = "views"
+
+    # Optional columns
+    col_likes = find_col(df, ["Likes"])
+    col_comments = find_col(df, ["Comments added"])
+    col_watch = find_col(df, ["Watch time (hours)"])
+    col_subs = find_col(df, ["Subscribers"])
+    col_impr = find_col(df, ["Impressions"])
+    col_ctr = find_col(df, ["Impressions click-through rate (%)"])
+
+    if col_likes:
+        rename_map[col_likes] = "likes"
+    if col_comments:
+        rename_map[col_comments] = "comments"
+    if col_watch:
+        rename_map[col_watch] = "watch_time_hours"
+    if col_subs:
+        rename_map[col_subs] = "subscribers"
+    if col_impr:
+        rename_map[col_impr] = "impressions"
+    if col_ctr:
+        rename_map[col_ctr] = "ctr_percent"
+
     df = df.rename(columns=rename_map)
 
-    # 4. Convert numeric columns
+    # Convert numerics where present
     numeric_cols = [
         "views",
         "watch_time_hours",
@@ -59,21 +119,17 @@ def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
         "ctr_percent",
         "subscribers",
         "likes",
-        "dislikes",
-        "shares",
+        "dislikes",  # if present
+        "shares",    # if present
         "comments",
     ]
     for c in numeric_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # 5. Drop rows missing key fields
+    # Drop rows missing key fields
     df = df.dropna(subset=["publish_date"])
-    if "views" in df.columns:
-        df = df.dropna(subset=["views"])
-    else:
-        st.error("Column 'Views' not found (or renamed incorrectly).")
-        return pd.DataFrame()
+    df = df.dropna(subset=["views"])
 
     return df
 
@@ -136,19 +192,28 @@ def predict_views_for_day(day_model, dow, total_curve, expected_factor=1.0):
 
 st.title("YouTube Creator Day Planner")
 
+st.markdown(
+    "Upload a **YouTube Studio video report CSV** (Advanced mode, video-level). "
+    "Make sure it includes at least the publish date and views for each video."
+)
+
 uploaded = st.sidebar.file_uploader("Upload YouTube Studio CSV", type=["csv"])
 
 if uploaded is None:
     st.info("Upload your CSV from the sidebar to begin.")
 else:
-    df_raw = pd.read_csv(uploaded)
+    try:
+        df_raw = pd.read_csv(uploaded)
+    except Exception as e:
+        st.error(f"Could not read CSV file: {e}")
+        st.stop()
+
     st.subheader("Raw data preview")
     st.dataframe(df_raw.head())
 
     df = load_and_clean(df_raw)
 
     if df.empty:
-        st.error("No usable rows after cleaning. Check your CSV.")
         st.stop()
 
     st.success(f"Loaded {len(df)} videos after cleaning.")
@@ -188,7 +253,7 @@ else:
         )
         st.altair_chart(chart_ts, use_container_width=True)
 
-        # Best month metrics
+        # Best month metrics (if year_month exists)
         if "year_month" in df.columns:
             month_views = (
                 df.groupby("year_month")["views"]
@@ -198,13 +263,23 @@ else:
             )
             best_month_views = month_views.iloc[0]
 
-            month_counts = (
-                df.groupby("year_month")["Content"]
-                .count()
-                .reset_index()
-                .rename(columns={"Content": "video_count"})
-                .sort_values("video_count", ascending=False)
-            )
+            # For count, fall back to counting rows if Content not present
+            if "Content" in df.columns:
+                month_counts = (
+                    df.groupby("year_month")["Content"]
+                    .count()
+                    .reset_index()
+                    .rename(columns={"Content": "video_count"})
+                    .sort_values("video_count", ascending=False)
+                )
+            else:
+                month_counts = (
+                    df.groupby("year_month")["views"]
+                    .count()
+                    .reset_index()
+                    .rename(columns={"views": "video_count"})
+                    .sort_values("video_count", ascending=False)
+                )
             best_month_videos = month_counts.iloc[0]
 
             st.markdown("### Monthly performance")
@@ -231,13 +306,10 @@ else:
             )
             st.altair_chart(chart_month, use_container_width=True)
 
-        # Most liked / most commented videos
+        # Engagement highlights (only if columns exist)
         st.markdown("### Engagement highlights")
 
-        cols_to_show = ["Video title", "views", "likes", "comments", "publish_date"]
-        existing_cols = [c for c in cols_to_show if c in df.columns]
-
-        if "likes" in df.columns and not df["likes"].isna().all():
+        if "likes" in df.columns and df["likes"].notna().any():
             most_liked = df.sort_values("likes", ascending=False).iloc[0]
             st.write("**Most liked video:**")
             st.write(
@@ -245,7 +317,7 @@ else:
                 f"({int(most_liked['likes'])} likes, {int(most_liked['views'])} views)"
             )
 
-        if "comments" in df.columns and not df["comments"].isna().all():
+        if "comments" in df.columns and df["comments"].notna().any():
             most_commented = df.sort_values("comments", ascending=False).iloc[0]
             st.write("**Most commented video:**")
             st.write(
@@ -254,6 +326,8 @@ else:
             )
 
         st.markdown("### Top videos (by views)")
+        cols_to_show = ["Video title", "views", "likes", "comments", "publish_date"]
+        existing_cols = [c for c in cols_to_show if c in df.columns]
         top_n = st.slider("Show top N videos", 5, 50, 10)
         top_videos = df.sort_values("views", ascending=False).head(top_n)[existing_cols]
         st.dataframe(top_videos)
@@ -341,7 +415,7 @@ else:
         for i in range(n_scenarios):
             st.markdown(f"### Scenario {i+1}")
             with st.expander(f"Configure Scenario {i+1}", expanded=True):
-                name = st.text_input(f"Scenario {i+1} name", value=f"Scenario {i+1}")
+                name = st.textinput(f"Scenario {i+1} name", value=f"Scenario {i+1}")
                 vids_per_week = st.slider(
                     f"Videos per week (Scenario {i+1})", 1, 14, 3
                 )
