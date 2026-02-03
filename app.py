@@ -17,11 +17,14 @@ def debug_columns(df_raw: pd.DataFrame):
 
 def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean YouTube Studio export based on the example screenshot.
+    Clean YouTube Studio export based on your structure:
+    Content, Video title, Video publish time, Duration, Likes, Dislikes, Shares,
+    Comments added, Views, Watch time (hours), Subscribers, Impressions,
+    Impressions click-through rate (%)
     """
     df = df_raw.copy()
 
-    # 0. Show columns to help debugging
+    # Debug info
     debug_columns(df_raw)
 
     # 1. Drop 'Total' summary row
@@ -35,25 +38,12 @@ def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
         st.error("Expected column 'Video publish time' not found. Check CSV headers.")
         return pd.DataFrame()
 
-    # Try multiple date formats commonly used by YouTube exports
+    # Use pandas inference (works according to your debug: 127 non-null)
     date_series = df["Video publish time"].astype(str).str.strip()
-    parsed = None
-    tried_formats = ["%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", None]  # None = let pandas infer
+    parsed = pd.to_datetime(date_series, errors="coerce")  # infer format
+    st.write(f"Parsed publish dates (infer): {parsed.notna().sum()} non-null")
 
-    for fmt in tried_formats:
-        if fmt is None:
-            tmp = pd.to_datetime(date_series, errors="coerce")
-            fmt_name = "infer"
-        else:
-            tmp = pd.to_datetime(date_series, format=fmt, errors="coerce")
-            fmt_name = fmt
-        valid = tmp.notna().sum()
-        st.write(f"Trying date format {fmt_name}: parsed {valid} non-null dates")
-        if valid > 0:
-            parsed = tmp
-            break
-
-    if parsed is None or parsed.notna().sum() == 0:
+    if parsed.notna().sum() == 0:
         st.error("Could not parse any dates from 'Video publish time'.")
         return pd.DataFrame()
 
@@ -176,7 +166,7 @@ else:
     df = load_and_clean(df_raw)
 
     if df.empty:
-        st.error("Still no usable rows after cleaning. Check the debug info above (columns and sample dates).")
+        st.error("No usable rows after cleaning. Check the debug info above.")
         st.stop()
 
     st.success(f"Loaded {len(df)} videos after cleaning.")
@@ -188,15 +178,16 @@ else:
         ["📊 Dashboard", "📅 Best Day", "🗓️ Post Planner", "🎯 Scenario Planner"]
     )
 
-    # --- DASHBOARD ---
+    # ---------- DASHBOARD ----------
     with tab_dash:
         st.subheader("Channel Overview")
+
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Views", int(df["views"].sum()))
         col2.metric("Total Videos", df.shape[0])
         col3.metric("Avg Views / Video", f"{df['views'].mean():.0f}")
 
-        st.markdown("### Views over time")
+        st.markdown("### Views over time (by publish date)")
         ts = (
             df.groupby("publish_date")["views"]
             .sum()
@@ -209,69 +200,183 @@ else:
             .encode(
                 x=alt.X("publish_date:T", title="Publish Date"),
                 y=alt.Y("views:Q", title="Views"),
+                tooltip=["publish_date:T", "views:Q"],
             )
+            .properties(height=300)
         )
         st.altair_chart(chart_ts, use_container_width=True)
 
-    # --- BEST DAY ---
+        st.markdown("### Average views by day of week")
+        day_perf = (
+            df.groupby("dow")["views"].mean().reset_index().rename(columns={"views": "avg_views"})
+        )
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        day_perf["dow"] = pd.Categorical(day_perf["dow"], categories=day_order, ordered=True)
+        day_perf = day_perf.sort_values("dow")
+
+        chart_day = (
+            alt.Chart(day_perf)
+            .mark_bar()
+            .encode(
+                x=alt.X("dow:N", title="Day of Week"),
+                y=alt.Y("avg_views:Q", title="Avg Views per Video"),
+                tooltip=["dow", "avg_views"],
+            )
+            .properties(height=300)
+        )
+        st.altair_chart(chart_day, use_container_width=True)
+
+    # ---------- BEST DAY ----------
     with tab_best:
         st.subheader("Best Day to Post")
+
         res_top3, full_day_perf = best_days(df, top_k=3)
         if res_top3 is None or res_top3.empty:
             st.warning("Not enough data to compute best days.")
         else:
+            st.markdown("#### Top days by average views per video")
             st.dataframe(res_top3)
 
-    # --- POST PLANNER ---
+            st.markdown("#### Average views per video by day")
+            perf = full_day_perf.copy()
+            perf["dow"] = pd.Categorical(perf["dow"], categories=day_order, ordered=True)
+            perf = perf.sort_values("dow")
+
+            chart = (
+                alt.Chart(perf)
+                .mark_bar()
+                .encode(
+                    x=alt.X("dow:N", title="Day of Week"),
+                    y=alt.Y("avg_views:Q", title="Avg Views per Video"),
+                    tooltip=["dow", "avg_views"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # ---------- POST PLANNER ----------
     with tab_planner:
-        st.subheader("Post Planner")
+        st.subheader("Post Planner: Predict Views for a Planned Day")
+
         dow_options = list(day_model["dow"].dropna().unique())
-        if dow_options:
-            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        if not dow_options:
+            st.warning("No days found in data.")
+        else:
             dow_sorted = [d for d in day_order if d in dow_options]
+
             dow_choice = st.selectbox("Planned day of week", dow_sorted)
-            factor = st.slider("Multiplier vs typical video on this day", 0.5, 1.5, 1.0, step=0.05)
-            total_views, curve_df = predict_views_for_day(day_model, dow_choice, template_curve_days, factor)
-            st.metric("Predicted 14-day views", f"{int(total_views):,}")
+
+            st.markdown("Content strength vs typical videos on that day.")
+            factor = st.slider(
+                "Multiplier vs typical video on this day",
+                0.5,
+                1.5,
+                1.0,
+                step=0.05,
+            )
+
+            total_views, curve_df = predict_views_for_day(
+                day_model, dow_choice, template_curve_days, expected_factor=factor
+            )
+
+            col1, col2 = st.columns(2)
+            col1.metric("Predicted 14-day views", f"{int(total_views):,}")
+            col2.metric("Day baseline views", f"{int(total_views / factor):,}")
+
+            st.markdown("#### Predicted view accumulation (first 14 days)")
             chart_curve = (
                 alt.Chart(curve_df)
                 .mark_line()
                 .encode(
-                    x="day_since_publish:Q",
-                    y="predicted_views:Q",
+                    x=alt.X("day_since_publish:Q", title="Days since publish"),
+                    y=alt.Y("predicted_views:Q", title="Predicted cumulative views"),
+                    tooltip=["day_since_publish", "predicted_views"],
                 )
+                .properties(height=300)
             )
             st.altair_chart(chart_curve, use_container_width=True)
 
-
-    # --- SCENARIO PLANNER (kept simple) ---
+    # ---------- SCENARIO PLANNER ----------
     with tab_scenarios:
         st.subheader("Scenario Planner")
+
         horizon_days = st.selectbox("Horizon (days)", [30, 60, 90], index=0)
         n_scenarios = st.slider("Number of scenarios", 1, 3, 2)
-        results = []
+        scenario_results = []
+
         for i in range(n_scenarios):
-            with st.expander(f"Scenario {i+1}", expanded=True):
-                name = st.text_input(f"Name {i+1}", value=f"Scenario {i+1}")
-                vids_per_week = st.slider(f"Videos per week {i+1}", 1, 14, 3)
+            st.markdown(f"### Scenario {i+1}")
+            with st.expander(f"Configure Scenario {i+1}", expanded=True):
+                name = st.text_input(f"Scenario {i+1} name", value=f"Scenario {i+1}")
+                vids_per_week = st.slider(
+                    f"Videos per week (Scenario {i+1})", 1, 14, 3
+                )
                 dow_multi = st.multiselect(
-                    f"Posting days {i+1}",
+                    f"Posting days of week (Scenario {i+1})",
                     options=sorted(day_model["dow"].dropna().unique().tolist()),
                     default=sorted(day_model["dow"].dropna().unique().tolist())[:3],
                 )
-                factor = st.slider(f"Strength multiplier {i+1}", 0.5, 1.5, 1.0, step=0.05)
+                content_factor = st.slider(
+                    f"Avg content strength multiplier (Scenario {i+1})",
+                    0.5,
+                    1.5,
+                    1.0,
+                    step=0.05,
+                )
+
             if dow_multi:
                 weeks = horizon_days / 7
-                n_vids = int(vids_per_week * weeks)
-                views_list = []
-                for v in range(n_vids):
+                n_videos = int(vids_per_week * weeks)
+
+                simulated_views = []
+                for v in range(n_videos):
                     d = dow_multi[v % len(dow_multi)]
                     row = day_model[day_model["dow"] == d]
-                    base = row["expected_views"].iloc[0] if not row.empty else day_model["expected_views"].mean()
-                    views_list.append(base * factor)
-                total = np.sum(views_list)
-                results.append({"Scenario": name, "Videos": n_vids, "Total Views": total})
+                    if row.empty:
+                        base = day_model["expected_views"].mean()
+                    else:
+                        base = row["expected_views"].iloc[0]
+                    simulated_views.append(base * content_factor)
 
-        if results:
-            res_df = pd.DataFrame(results)
+                total_views_scenario = float(np.sum(simulated_views))
+                avg_views_per_video = total_views_scenario / max(n_videos, 1)
+
+                scenario_results.append(
+                    {
+                        "Scenario": name,
+                        "Videos": n_videos,
+                        "Total Views": total_views_scenario,
+                        "Avg Views/Video": avg_views_per_video,
+                    }
+                )
+
+        if scenario_results:
+            res_df = pd.DataFrame(scenario_results)
+            st.markdown("### Scenario summary")
             st.dataframe(res_df)
+
+            st.markdown("### Total views by scenario")
+            chart_scen_total = (
+                alt.Chart(res_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Scenario:N"),
+                    y=alt.Y("Total Views:Q"),
+                    tooltip=["Scenario", "Total Views", "Videos", "Avg Views/Video"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart_scen_total, use_container_width=True)
+
+            st.markdown("### Average views per video by scenario")
+            chart_scen_avg = (
+                alt.Chart(res_df)
+                .mark_bar(color="#FF7F0E")
+                .encode(
+                    x=alt.X("Scenario:N"),
+                    y=alt.Y("Avg Views/Video:Q"),
+                    tooltip=["Scenario", "Total Views", "Videos", "Avg Views/Video"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart_scen_avg, use_container_width=True)
