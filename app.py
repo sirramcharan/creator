@@ -134,7 +134,7 @@ def predict_views_for_day(day_model, dow, total_curve, expected_factor=1.0):
 
 # ---------- APP ----------
 
-st.title("YouTube Creator Day Planner (Thesis Prototype)")
+st.title("YouTube Creator Day Planner")
 
 uploaded = st.sidebar.file_uploader("Upload YouTube Studio CSV", type=["csv"])
 
