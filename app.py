@@ -26,7 +26,6 @@ def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
         st.error("Expected column 'Video publish time' not found. Check CSV headers.")
         return pd.DataFrame()
 
-    # Let pandas infer the date format (works for your data)
     date_series = df["Video publish time"].astype(str).str.strip()
     parsed = pd.to_datetime(date_series, errors="coerce")
 
@@ -36,6 +35,7 @@ def load_and_clean(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df["publish_date"] = parsed.dt.date
     df["dow"] = parsed.dt.day_name()
+    df["year_month"] = parsed.dt.to_period("M").astype(str)  # e.g. '2025-12'
 
     # 3. Rename numeric columns to simpler names
     rename_map = {
@@ -188,25 +188,75 @@ else:
         )
         st.altair_chart(chart_ts, use_container_width=True)
 
-        st.markdown("### Average views by day of week")
-        day_perf = (
-            df.groupby("dow")["views"].mean().reset_index().rename(columns={"views": "avg_views"})
-        )
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        day_perf["dow"] = pd.Categorical(day_perf["dow"], categories=day_order, ordered=True)
-        day_perf = day_perf.sort_values("dow")
-
-        chart_day = (
-            alt.Chart(day_perf)
-            .mark_bar()
-            .encode(
-                x=alt.X("avg_views:Q", title="Avg Views per Video"),
-                y=alt.Y("dow:N", title="Day of Week"),
-                tooltip=["dow", "avg_views"],
+        # Best month metrics
+        if "year_month" in df.columns:
+            month_views = (
+                df.groupby("year_month")["views"]
+                .sum()
+                .reset_index()
+                .sort_values("views", ascending=False)
             )
-            .properties(height=300)
-        )
-        st.altair_chart(chart_day, use_container_width=True)
+            best_month_views = month_views.iloc[0]
+
+            month_counts = (
+                df.groupby("year_month")["Content"]
+                .count()
+                .reset_index()
+                .rename(columns={"Content": "video_count"})
+                .sort_values("video_count", ascending=False)
+            )
+            best_month_videos = month_counts.iloc[0]
+
+            st.markdown("### Monthly performance")
+            colm1, colm2 = st.columns(2)
+            colm1.metric(
+                "Best month by views",
+                f"{best_month_views['year_month']} ({int(best_month_views['views']):,} views)",
+            )
+            colm2.metric(
+                "Best month by number of videos",
+                f"{best_month_videos['year_month']} ({int(best_month_videos['video_count'])} videos)",
+            )
+
+            st.markdown("#### Views by month")
+            chart_month = (
+                alt.Chart(month_views.sort_values("year_month"))
+                .mark_bar()
+                .encode(
+                    x=alt.X("year_month:N", title="Year-Month"),
+                    y=alt.Y("views:Q", title="Total Views"),
+                    tooltip=["year_month", "views"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart_month, use_container_width=True)
+
+        # Most liked / most commented videos
+        st.markdown("### Engagement highlights")
+
+        cols_to_show = ["Video title", "views", "likes", "comments", "publish_date"]
+        existing_cols = [c for c in cols_to_show if c in df.columns]
+
+        if "likes" in df.columns and not df["likes"].isna().all():
+            most_liked = df.sort_values("likes", ascending=False).iloc[0]
+            st.write("**Most liked video:**")
+            st.write(
+                f"{most_liked.get('Video title', 'N/A')} "
+                f"({int(most_liked['likes'])} likes, {int(most_liked['views'])} views)"
+            )
+
+        if "comments" in df.columns and not df["comments"].isna().all():
+            most_commented = df.sort_values("comments", ascending=False).iloc[0]
+            st.write("**Most commented video:**")
+            st.write(
+                f"{most_commented.get('Video title', 'N/A')} "
+                f"({int(most_commented['comments'])} comments, {int(most_commented['views'])} views)"
+            )
+
+        st.markdown("### Top videos (by views)")
+        top_n = st.slider("Show top N videos", 5, 50, 10)
+        top_videos = df.sort_values("views", ascending=False).head(top_n)[existing_cols]
+        st.dataframe(top_videos)
 
     # ---------- BEST DAY ----------
     with tab_best:
@@ -220,6 +270,7 @@ else:
             st.dataframe(res_top3)
 
             st.markdown("#### Average views per video by day")
+            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
             perf = full_day_perf.copy()
             perf["dow"] = pd.Categorical(perf["dow"], categories=day_order, ordered=True)
             perf = perf.sort_values("dow")
@@ -240,6 +291,7 @@ else:
     with tab_planner:
         st.subheader("Post Planner: Predict Views for a Planned Day")
 
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         dow_options = list(day_model["dow"].dropna().unique())
         if not dow_options:
             st.warning("No days found in data.")
