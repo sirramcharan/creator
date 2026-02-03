@@ -415,7 +415,8 @@ else:
         for i in range(n_scenarios):
             st.markdown(f"### Scenario {i+1}")
             with st.expander(f"Configure Scenario {i+1}", expanded=True):
-                name = st.textinput(f"Scenario {i+1} name", value=f"Scenario {i+1}")
+                # FIX: use st.text_input (not st.textinput)
+                name = st.text_input(f"Scenario {i+1} name", value=f"Scenario {i+1}")
                 vids_per_week = st.slider(
                     f"Videos per week (Scenario {i+1})", 1, 14, 3
                 )
