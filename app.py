@@ -5,39 +5,29 @@ import altair as alt
 from datetime import datetime, timedelta
 
 # ------------- CONFIG -----------------
-st.set_page_config(page_title="Creator Post Planner", layout="wide")
+st.set_page_config(page_title="YouTube Creator Day Planner", layout="wide")
 
 
 # ------------- UTILS ------------------
-def parse_datetime_col(df):
+def parse_date_col(df):
     """
-    Tries to create a unified 'published_at' column as datetime.
-    Adapt this function based on your actual export schema.
+    Tries to create a 'publish_date' column as datetime.date.
+    Adapt based on your actual export (e.g., 'Date' or 'Video publish time').
     """
-    possible_datetime_cols = ["publishedAt", "publish_time", "publish_date", "date"]
-    dt_col = None
+    possible_date_cols = ["publish_date", "date", "Video publish time", "Video publish date"]
+    date_col = None
 
-    for c in possible_datetime_cols:
+    for c in possible_date_cols:
         if c in df.columns:
-            dt_col = c
+            date_col = c
             break
 
-    if dt_col is None:
-        # If no single datetime col, try combining date + time
-        if "date" in df.columns and "time" in df.columns:
-            df["published_at"] = pd.to_datetime(
-                df["date"].astype(str) + " " + df["time"].astype(str),
-                errors="coerce",
-            )
-        else:
-            st.error("Could not find a publish datetime column. Please adjust code.")
-            return df
-    else:
-        df["published_at"] = pd.to_datetime(df[dt_col], errors="coerce")
+    if date_col is None:
+        st.error("Could not find a publish date column. Please rename in the CSV or adjust code.")
+        return df
 
-    df["publish_date"] = df["published_at"].dt.date
-    df["publish_hour"] = df["published_at"].dt.hour
-    df["dow"] = df["published_at"].dt.day_name()
+    df["publish_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.date
+    df["dow"] = pd.to_datetime(df["publish_date"]).dt.day_name()
     return df
 
 
@@ -50,46 +40,34 @@ def ensure_numeric(df, cols):
     return df
 
 
-def compute_slot(df, slot_minutes=60):
-    df["slot"] = (df["publish_hour"] * 60 // slot_minutes).astype(int)
-    df["slot_label"] = df["slot"].apply(lambda s: f"{(s*slot_minutes)//60:02d}:00")
-    return df
-
-
-def best_slots(df, horizon_days=7, top_k=3):
+def best_days(df, top_k=3):
     """
-    Compute best posting windows (day_of_week, slot) based on normalized views.
-
-    Assumes df has:
-      - published_at
-      - views
-      - dow
-      - slot
+    Compute best days of week based on average views per video.
     """
-    if "published_at" not in df.columns:
-        return None
+    if "dow" not in df.columns:
+        return None, None
 
-    # For simplicity, approximate "7-day views" as total views (for each video)
-    # In a more detailed implementation, we'd need daily video-level views.
-    slot_perf = (
-        df.groupby(["dow", "slot", "slot_label"], dropna=False)["views"]
+    day_perf = (
+        df.groupby("dow", dropna=False)["views"]
         .mean()
         .reset_index()
-    )
-    slot_perf = slot_perf.dropna(subset=["views"])
-    slot_perf = slot_perf.sort_values("views", ascending=False)
+        .rename(columns={"views": "avg_views"})
+    ).dropna(subset=["avg_views"])
 
-    return slot_perf.head(top_k), slot_perf
+    if day_perf.empty:
+        return None, None
+
+    day_perf_sorted = day_perf.sort_values("avg_views", ascending=False)
+    return day_perf_sorted.head(top_k), day_perf_sorted
 
 
-def build_slot_model(df):
+def build_day_model(df):
     """
-    Build a simple slot-based model:
-    - For each (dow, slot), compute average views per video.
-    - This will be used as the base for predicting total views for a planned post.
+    Build a simple model:
+    - For each day of week, compute average views per video.
     """
     model = (
-        df.groupby(["dow", "slot", "slot_label"], dropna=False)["views"]
+        df.groupby("dow", dropna=False)["views"]
         .mean()
         .reset_index()
         .rename(columns={"views": "expected_views"})
@@ -97,50 +75,41 @@ def build_slot_model(df):
     return model
 
 
-def get_view_curve_template(df, n_points=72):
+def get_view_curve_template_days(n_days=14):
     """
-    Construct a generic non-linear accumulation curve for views over hours.
-    In reality, you would derive this from time-series data.
-    Here we build a simple S-shaped curve + small later bump.
+    Construct a generic non-linear accumulation curve for views over days.
+    S-shaped early, then plateau, with a small later bump.
     """
-    # x = hours since publish
-    x = np.linspace(0, n_points - 1, n_points)
+    x = np.arange(0, n_days)  # days since publish
 
-    # Base S-shaped curve with logistic function
-    k = 0.2  # steepness
-    midpoint = 12
+    # Logistic S-curve
+    k = 0.6
+    midpoint = 3
     base = 1 / (1 + np.exp(-k * (x - midpoint)))
-
-    # Normalize to max 1
     base = base / base.max()
 
-    # Add a small bump later (e.g., re-surfacing by algorithm)
-    bump_center = 48
-    bump_width = 8
+    # Small bump around day 7
+    bump_center = 7
+    bump_width = 2
     bump = 0.15 * np.exp(-((x - bump_center) ** 2) / (2 * bump_width**2))
 
     curve = base + bump
     curve = curve / curve.max()
 
-    # Convert to cumulative proportion over time
     cum_curve = np.cumsum(curve)
     cum_curve = cum_curve / cum_curve.max()
 
-    return pd.DataFrame({"hour_since_publish": x, "cum_frac": cum_curve})
+    return pd.DataFrame({"day_since_publish": x, "cum_frac": cum_curve})
 
 
-def predict_views_for_slot(slot_model, dow, slot, total_curve, expected_factor=1.0):
+def predict_views_for_day(day_model, dow, total_curve, expected_factor=1.0):
     """
-    Given a day-of-week and slot, get expected total views and produce a full curve.
-    expected_factor allows scenario adjustments (e.g. +10%).
+    Given a day-of-week, get expected total views and produce a full curve.
     """
-    row = slot_model[
-        (slot_model["dow"] == dow) & (slot_model["slot"] == slot)
-    ]
+    row = day_model[day_model["dow"] == dow]
 
     if row.empty:
-        # Fallback: global mean
-        base_views = slot_model["expected_views"].mean()
+        base_views = day_model["expected_views"].mean()
     else:
         base_views = row["expected_views"].iloc[0]
 
@@ -153,11 +122,11 @@ def predict_views_for_slot(slot_model, dow, slot, total_curve, expected_factor=1
 
 # ------------- APP --------------------
 
-st.title("YouTube Creator Post Planner (Thesis Prototype)")
+st.title("YouTube Creator Day Planner (Thesis Prototype)")
 
 st.markdown(
     "Upload your YouTube Studio export, explore your channel, "
-    "see best posting times, and plan future posts with scenario simulations."
+    "discover your best posting **day**, and plan future uploads with scenario simulations."
 )
 
 # --- Sidebar: Upload ---
@@ -169,29 +138,25 @@ if uploaded_file is not None:
     st.success("File uploaded. Preview below:")
     st.dataframe(df_raw.head())
 
-    # Assumptions: these columns exist or will be renamed accordingly.
     df = df_raw.copy()
 
-    # Parse datetime
-    df = parse_datetime_col(df)
+    # Parse publish date -> day of week
+    df = parse_date_col(df)
 
-    # Ensure numeric metrics exist
-    numeric_cols = ["views", "impressions", "ctr", "watch_time_hours"]
+    # Ensure numeric metrics
+    numeric_cols = ["views", "watch_time_hours", "impressions", "ctr"]
     df = ensure_numeric(df, numeric_cols)
 
-    # Add slot & day-of-week
-    df = compute_slot(df, slot_minutes=60)
-
-    # Handle missing views
+    # Drop rows without views
     df = df.dropna(subset=["views"])
 
     # Build model artifacts
-    slot_model = build_slot_model(df)
-    template_curve = get_view_curve_template(df, n_points=72)
+    day_model = build_day_model(df)
+    template_curve_days = get_view_curve_template_days(n_days=14)
 
     # Create tabs
     tab_dash, tab_best, tab_planner, tab_scenarios = st.tabs(
-        ["📊 Dashboard", "⏰ Best Time to Post", "📅 Post Planner", "🎯 Scenario Planner"]
+        ["📊 Dashboard", "📅 Best Day", "🗓️ Post Planner", "🎯 Scenario Planner"]
     )
 
     # ------ DASHBOARD TAB ------
@@ -210,8 +175,8 @@ if uploaded_file is not None:
         else:
             col4.metric("Total Watch Time (hrs)", "N/A")
 
-        # Time series
-        st.markdown("### Views over time")
+        # Time series by publish date
+        st.markdown("### Views over time (by publish date)")
         if "publish_date" in df.columns:
             ts = (
                 df.groupby("publish_date")["views"]
@@ -223,130 +188,157 @@ if uploaded_file is not None:
                 alt.Chart(ts)
                 .mark_line()
                 .encode(
-                    x="publish_date:T",
-                    y="views:Q",
+                    x=alt.X("publish_date:T", title="Publish Date"),
+                    y=alt.Y("views:Q", title="Views"),
                     tooltip=["publish_date:T", "views:Q"],
                 )
                 .properties(height=300)
             )
             st.altair_chart(chart_ts, use_container_width=True)
 
+        # Views by day of week
+        st.markdown("### Average views by day of week")
+        if "dow" in df.columns:
+            day_perf = (
+                df.groupby("dow")["views"].mean().reset_index().rename(columns={"views": "avg_views"})
+            )
+            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            day_perf["dow"] = pd.Categorical(day_perf["dow"], categories=day_order, ordered=True)
+            day_perf = day_perf.sort_values("dow")
+
+            chart_day = (
+                alt.Chart(day_perf)
+                .mark_bar()
+                .encode(
+                    x=alt.X("dow:N", title="Day of Week"),
+                    y=alt.Y("avg_views:Q", title="Avg Views per Video"),
+                    tooltip=["dow", "avg_views"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart_day, use_container_width=True)
+
         # Top videos
         st.markdown("### Top Videos")
         top_n = st.slider("Show top N videos by views", 5, 50, 10)
-        top_videos = df.sort_values("views", ascending=False).head(top_n)[
-            ["title", "views", "impressions", "ctr", "watch_time_hours", "published_at"]
-            if "watch_time_hours" in df.columns
-            else ["title", "views", "impressions", "ctr", "published_at"]
-        ]
+        display_cols = [c for c in ["title", "views", "impressions", "ctr", "watch_time_hours", "publish_date"] if c in df.columns]
+        top_videos = df.sort_values("views", ascending=False).head(top_n)[display_cols]
         st.dataframe(top_videos)
 
-    # ------ BEST TIME TAB ------
+    # ------ BEST DAY TAB ------
     with tab_best:
-        st.subheader("Best Days & Times to Post")
+        st.subheader("Best Day to Post")
 
-        res_top3, full_slot_perf = best_slots(df, top_k=3)
+        res_top3, full_day_perf = best_days(df, top_k=3)
 
         if res_top3 is None or res_top3.empty:
-            st.warning("Not enough data to compute best posting windows.")
+            st.warning("Not enough data to compute best days.")
         else:
-            st.markdown("#### Top 3 posting windows (by average views per video)")
-            st.dataframe(res_top3[["dow", "slot_label", "views"]])
+            st.markdown("#### Top days by average views per video")
+            st.dataframe(res_top3)
 
-            st.markdown("#### Heatmap: Average views by day and hour")
-            if not full_slot_perf.empty:
-                heat = full_slot_perf.copy()
-                heat_chart = (
-                    alt.Chart(heat)
-                    .mark_rect()
+            if full_day_perf is not None and not full_day_perf.empty:
+                st.markdown("#### Average views per video by day")
+                day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                perf = full_day_perf.copy()
+                perf["dow"] = pd.Categorical(perf["dow"], categories=day_order, ordered=True)
+                perf = perf.sort_values("dow")
+
+                chart = (
+                    alt.Chart(perf)
+                    .mark_bar()
                     .encode(
-                        x=alt.X("slot_label:N", title="Hour Slot"),
-                        y=alt.Y("dow:N", title="Day of Week"),
-                        color=alt.Color("views:Q", title="Avg Views", scale=alt.Scale(scheme="blues")),
-                        tooltip=["dow", "slot_label", "views"],
+                        x=alt.X("dow:N", title="Day of Week"),
+                        y=alt.Y("avg_views:Q", title="Avg Views per Video"),
+                        tooltip=["dow", "avg_views"],
                     )
                     .properties(height=300)
                 )
-                st.altair_chart(heat_chart, use_container_width=True)
+                st.altair_chart(chart, use_container_width=True)
 
     # ------ POST PLANNER TAB ------
     with tab_planner:
-        st.subheader("Post Planner: Predict Views for a Planned Upload")
+        st.subheader("Post Planner: Predict Views for a Planned Day")
 
         st.markdown(
-            "Select a **day** and **time** you plan to upload. "
-            "The app predicts expected views and shows a **non-linear** view accumulation curve."
+            "Pick a **day of week** you plan to upload. "
+            "The app predicts expected 14-day views and shows a **non-linear** view accumulation curve."
         )
 
-        # Inputs for planned post
-        dow_options = list(slot_model["dow"].dropna().unique())
-        dow_choice = st.selectbox("Day of Week", sorted(dow_options))
-
-        slot_labels = (
-            slot_model[slot_model["dow"] == dow_choice]["slot_label"]
-            .dropna()
-            .unique()
-        )
-        if len(slot_labels) == 0:
-            st.warning("No slot data for this day of week. Choose another.")
+        dow_options = list(day_model["dow"].dropna().unique())
+        if not dow_options:
+            st.warning("No valid days found in data.")
         else:
-            # Slider over hour slots
-            slot_labels_sorted = sorted(slot_labels)
-            slot_label_choice = st.select_slider(
-                "Hour Slot", options=slot_labels_sorted, value=slot_labels_sorted[0]
+            day_order_all = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            dow_options_sorted = [d for d in day_order_all if d in dow_options]
+
+            dow_choice = st.selectbox("Planned day of week", dow_options_sorted)
+
+            st.markdown("Content strength: how strong you expect this video to be vs typical videos on that day.")
+            factor = st.slider(
+                "Multiplier vs typical video on this day",
+                0.5,
+                1.5,
+                1.0,
+                step=0.05,
             )
 
-            # Map back to numeric slot
-            slot_row = slot_model[
-                (slot_model["dow"] == dow_choice)
-                & (slot_model["slot_label"] == slot_label_choice)
-            ]
-            if slot_row.empty:
-                st.warning("Could not map slot label to slot. Please adjust data.")
-            else:
-                slot_value = int(slot_row["slot"].iloc[0])
+            total_views, curve_df = predict_views_for_day(
+                day_model, dow_choice, template_curve_days, expected_factor=factor
+            )
 
-                # Factor slider to simulate content strength (+/- 50% views)
-                st.markdown("Content strength adjustment (how strong you expect the video to be):")
-                factor = st.slider(
-                    "Multiplier vs typical video in this slot",
-                    0.5,
-                    1.5,
-                    1.0,
-                    step=0.05,
+            col1, col2 = st.columns(2)
+            col1.metric("Predicted 14-day views", f"{int(total_views):,}")
+            col2.metric("Day baseline views", f"{int(total_views / factor):,}")
+
+            st.markdown("#### Predicted view accumulation (first 14 days)")
+            chart_curve = (
+                alt.Chart(curve_df)
+                .mark_line()
+                .encode(
+                    x=alt.X("day_since_publish:Q", title="Days since publish"),
+                    y=alt.Y("predicted_views:Q", title="Predicted cumulative views"),
+                    tooltip=["day_since_publish", "predicted_views"],
                 )
+                .properties(height=300)
+            )
+            st.altair_chart(chart_curve, use_container_width=True)
 
-                total_views, curve_df = predict_views_for_slot(
-                    slot_model, dow_choice, slot_value, template_curve, expected_factor=factor
+            # Optional: compare different days with a slider
+            st.markdown("#### Compare days quickly")
+            compare_dow = st.select_slider("Compare with another day", options=dow_options_sorted, value=dow_choice)
+            if compare_dow != dow_choice:
+                total_views_cmp, curve_df_cmp = predict_views_for_day(
+                    day_model, compare_dow, template_curve_days, expected_factor=1.0
                 )
+                comp_df = curve_df.copy()
+                comp_df["Scenario"] = dow_choice
+                curve_df_cmp["Scenario"] = compare_dow
+                merged = pd.concat([comp_df, curve_df_cmp], ignore_index=True)
 
-                col1, col2 = st.columns(2)
-                col1.metric("Predicted 7-day views", f"{int(total_views):,}")
-                col2.metric("Slot baseline views", f"{int(total_views / factor):,}")
-
-                st.markdown("#### Predicted view accumulation (first 72 hours)")
-                chart_curve = (
-                    alt.Chart(curve_df)
+                chart_compare = (
+                    alt.Chart(merged)
                     .mark_line()
                     .encode(
-                        x=alt.X("hour_since_publish:Q", title="Hours since publish"),
+                        x=alt.X("day_since_publish:Q", title="Days since publish"),
                         y=alt.Y("predicted_views:Q", title="Predicted cumulative views"),
-                        tooltip=["hour_since_publish", "predicted_views"],
+                        color="Scenario:N",
+                        tooltip=["Scenario", "day_since_publish", "predicted_views"],
                     )
                     .properties(height=300)
                 )
-                st.altair_chart(chart_curve, use_container_width=True)
+                st.altair_chart(chart_compare, use_container_width=True)
 
     # ------ SCENARIO PLANNER TAB ------
     with tab_scenarios:
         st.subheader("Scenario Planner")
 
         st.markdown(
-            "Compare different posting strategies for the next 30 or 90 days. "
-            "Each scenario defines posting days, slots, and content strength."
+            "Define different posting **schedules** (days + frequency) for the next 30–90 days "
+            "and compare their total predicted views."
         )
 
-        horizon_days = st.selectbox("Horizon", [30, 60, 90], index=0)
+        horizon_days = st.selectbox("Horizon (days)", [30, 60, 90], index=0)
 
         n_scenarios = st.slider("Number of scenarios", 1, 3, 2)
         scenario_results = []
@@ -358,17 +350,10 @@ if uploaded_file is not None:
                 videos_per_week = st.slider(
                     f"Videos per week (Scenario {i+1})", 1, 14, 3
                 )
-                # Day-of-week selection
                 dow_multi = st.multiselect(
                     f"Posting days of week (Scenario {i+1})",
-                    options=sorted(slot_model["dow"].dropna().unique()),
-                    default=sorted(slot_model["dow"].dropna().unique())[:3],
-                )
-                # Slot selection
-                slot_multi = st.multiselect(
-                    f"Hour slots (Scenario {i+1})",
-                    options=sorted(slot_model["slot_label"].dropna().unique()),
-                    default=sorted(slot_model["slot_label"].dropna().unique())[:2],
+                    options=sorted(day_model["dow"].dropna().unique().tolist()),
+                    default=sorted(day_model["dow"].dropna().unique().tolist())[:3],
                 )
                 content_factor = st.slider(
                     f"Avg content strength multiplier (Scenario {i+1})",
@@ -378,25 +363,17 @@ if uploaded_file is not None:
                     step=0.05,
                 )
 
-            if dow_multi and slot_multi:
-                # Approx number of videos in horizon
+            if dow_multi:
                 weeks = horizon_days / 7
                 n_videos = int(videos_per_week * weeks)
 
-                # Cycle through combos of (dow, slot) for simplicity
-                combos = [(d, s) for d in dow_multi for s in slot_multi]
-                if not combos:
-                    continue
-
-                # Simulate videos
+                combos = dow_multi
                 simulated_views = []
                 for v in range(n_videos):
-                    d, s_label = combos[v % len(combos)]
-                    row = slot_model[
-                        (slot_model["dow"] == d) & (slot_model["slot_label"] == s_label)
-                    ]
+                    d = combos[v % len(combos)]
+                    row = day_model[day_model["dow"] == d]
                     if row.empty:
-                        base = slot_model["expected_views"].mean()
+                        base = day_model["expected_views"].mean()
                     else:
                         base = row["expected_views"].iloc[0]
                     simulated_views.append(base * content_factor)
